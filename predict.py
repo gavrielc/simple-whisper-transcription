@@ -1,10 +1,8 @@
 # Prediction interface for Cog ⚙️
 from typing import Any, List
-import base64
 import datetime
 import subprocess
 import os
-import requests
 import time
 import torch
 import re
@@ -15,78 +13,66 @@ from pyannote.audio import Pipeline
 
 
 class Output(BaseModel):
-    segments: list
-    language: str = None
-    num_speakers: int = None
+    transcription: str
+
+
+def format_speech(speech_list):
+    def format_time(seconds):
+        # Convert the float to total seconds and then compute minutes and seconds
+        total_seconds = int(float(seconds))
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        # Format as m:ss
+        return f"{minutes}:{seconds:02}"
+
+    formatted_string = ""
+    for item in speech_list:
+        # Format the start time
+        start_time = format_time(item['start'])
+        formatted_string += f"{item['speaker']}\n[{start_time}]\n{item['text']}\n\n"
+    return formatted_string
 
 
 class Predictor(BasePredictor):
 
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
-        model_name = "large-v3"
+        model_name = "large-v2"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
         self.model = WhisperModel(
             model_name,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            compute_type="float16",
+            device=device,
+            compute_type="float16" if device == "cuda" else "float32",
         )
         self.diarization_model = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token="YOUR HF TOKEN HERE",
-        ).to(torch.device("cuda"))
+            use_auth_token="YOUR_HUGGINGFACE_TOKEN",
+        ).to(torch.device(device))
 
     def predict(
         self,
-        file_string: str = Input(
-            description="Either provide: Base64 encoded audio file,", default=None
-        ),
-        file_url: str = Input(
-            description="Or provide: A direct audio file URL", default=None
-        ),
-        file: Path = Input(description="Or an audio file", default=None),
-        group_segments: bool = Input(
-            description="Group segments of same speaker shorter apart than 2 seconds",
-            default=True,
-        ),
-        transcript_output_format: str = Input(
-            description="Specify the format of the transcript output: individual words with timestamps, full text of segments, or a combination of both.",
-            default="both",
-            choices=["words_only", "segments_only", "both"],
-        ),
-        num_speakers: int = Input(
-            description="Number of speakers, leave empty to autodetect.",
-            ge=1,
-            le=50,
-            default=None,
-        ),
-        language: str = Input(
-            description="Language of the spoken words as a language code like 'en'. Leave empty to auto detect language.",
-            default=None,
-        ),
+        file: Path = Input(description="Audio file", default=None),
         prompt: str = Input(
-            description="Vocabulary: provide names, acronyms and loanwords in a list. Use punctuation for best accuracy.",
+            description="Vocabulary: provide names, acronyms, and loanwords in a list. Use punctuation for best accuracy.",
             default=None,
-        ),
-        # word_timestamps: bool = Input(description="Return word timestamps", default=True), needs to be implemented
-        offset_seconds: int = Input(
-            description="Offset in seconds, used for chunked inputs", default=0, ge=0
         ),
     ) -> Output:
         """Run a single prediction on the model"""
-        # Check if either filestring, filepath or file is provided, but only 1 of them
-        """ if sum([file_string is not None, file_url is not None, file is not None]) != 1:
-            raise RuntimeError("Provide either file_string, file or file_url") """
-
         try:
             # Generate a temporary filename
             temp_wav_filename = f"temp-{time.time_ns()}.wav"
+            offset_seconds = 0
+            group_segments = True
+            language = None
+            num_speakers = None
 
             if file is not None:
                 subprocess.run(
                     [
                         "ffmpeg",
                         "-i",
-                        file,
+                        str(file),
                         "-ar",
                         "16000",
                         "-ac",
@@ -94,57 +80,9 @@ class Predictor(BasePredictor):
                         "-c:a",
                         "pcm_s16le",
                         temp_wav_filename,
-                    ]
+                    ],
+                    check=True,
                 )
-
-            elif file_url is not None:
-                response = requests.get(file_url)
-                temp_audio_filename = f"temp-{time.time_ns()}.audio"
-                with open(temp_audio_filename, "wb") as file:
-                    file.write(response.content)
-
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-i",
-                        temp_audio_filename,
-                        "-ar",
-                        "16000",
-                        "-ac",
-                        "1",
-                        "-c:a",
-                        "pcm_s16le",
-                        temp_wav_filename,
-                    ]
-                )
-
-                if os.path.exists(temp_audio_filename):
-                    os.remove(temp_audio_filename)
-            elif file_string is not None:
-                audio_data = base64.b64decode(
-                    file_string.split(",")[1] if "," in file_string else file_string
-                )
-                temp_audio_filename = f"temp-{time.time_ns()}.audio"
-                with open(temp_audio_filename, "wb") as f:
-                    f.write(audio_data)
-
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-i",
-                        temp_audio_filename,
-                        "-ar",
-                        "16000",
-                        "-ac",
-                        "1",
-                        "-c:a",
-                        "pcm_s16le",
-                        temp_wav_filename,
-                    ]
-                )
-
-                if os.path.exists(temp_audio_filename):
-                    os.remove(temp_audio_filename)
 
             segments, detected_num_speakers, detected_language = self.speech_to_text(
                 temp_wav_filename,
@@ -154,19 +92,21 @@ class Predictor(BasePredictor):
                 group_segments,
                 language,
                 word_timestamps=True,
-                transcript_output_format=transcript_output_format,
+                transcript_output_format="segments_only",
             )
 
-            print(f"done with inference")
+            print(f"Done with inference")
+            print(
+                f"Number of Speakers: {detected_num_speakers}. Detected language: {detected_language}."
+            )
+            transcription = format_speech(segments)
             # Return the results as a JSON object
             return Output(
-                segments=segments,
-                language=detected_language,
-                num_speakers=detected_num_speakers,
+                transcription=transcription,
             )
 
         except Exception as e:
-            raise RuntimeError("Error Running inference with local model", e)
+            raise RuntimeError("Error running inference with local model") from e
 
         finally:
             # Clean up
@@ -190,7 +130,7 @@ class Predictor(BasePredictor):
         time_start = time.time()
 
         # Transcribe audio
-        print("Starting transcribing")
+        print("Starting transcription")
         options = dict(
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=1000),
@@ -221,24 +161,22 @@ class Predictor(BasePredictor):
 
         time_transcribing_end = time.time()
         print(
-            f"Finished with transcribing, took {time_transcribing_end - time_start:.5} seconds"
+            f"Finished transcription, took {time_transcribing_end - time_start:.5} seconds"
         )
 
         print("Starting diarization")
         diarization = self.diarization_model(audio_file_wav, num_speakers=num_speakers)
 
-        time_diraization_end = time.time()
+        time_diarization_end = time.time()
         print(
-            f"Finished with diarization, took {time_diraization_end - time_transcribing_end:.5} seconds"
+            f"Finished diarization, took {time_diarization_end - time_transcribing_end:.5} seconds"
         )
 
-        print("Starting merging")
+        print("Starting speaker assignment")
 
-        # Initialize variables to keep track of the current position in both lists
+        # Assign speakers to words
         margin = 0.1  # 0.1 seconds margin
-
-        # Initialize an empty list to hold the final segments with speaker info
-        final_segments = []
+        words_with_speakers = []
 
         diarization_list = list(diarization.itertracks(yield_label=True))
         unique_speakers = {
@@ -246,115 +184,131 @@ class Predictor(BasePredictor):
         }
         detected_num_speakers = len(unique_speakers)
 
-        speaker_idx = 0
-        n_speakers = len(diarization_list)
+        # Sort diarization segments by start time
+        diarization_list.sort(key=lambda x: x[0].start)
+        n_diarization_segments = len(diarization_list)
+        diarization_idx = 0
 
-        # Iterate over each segment
+        # Iterate over each word in all segments
         for segment in segments:
-            segment_start = segment["start"] + offset_seconds
-            segment_end = segment["end"] + offset_seconds
-            segment_text = []
-            segment_words = []
-
-            # Iterate over each word in the segment
             for word in segment["words"]:
-                word_start = word["start"] + offset_seconds - margin
-                word_end = word["end"] + offset_seconds + margin
+                word_start = word["start"] - margin
+                word_end = word["end"] + margin
 
-                while speaker_idx < n_speakers:
-                    turn, _, speaker = diarization_list[speaker_idx]
+                # Find the speaker for this word
+                while diarization_idx < n_diarization_segments:
+                    turn, _, speaker = diarization_list[diarization_idx]
 
-                    if turn.start <= word_end and turn.end >= word_start:
-                        # Add word without modifications
-                        segment_text.append(word["word"])
-
-                        # Strip here for individual word storage
-                        word["word"] = word["word"].strip()
-                        segment_words.append(word)
-
-                        if turn.end <= word_end:
-                            speaker_idx += 1
-
+                    if turn.end < word_start:
+                        # Move to the next diarization segment
+                        diarization_idx += 1
+                    elif turn.start > word_end:
+                        # Word occurs before the current diarization segment
                         break
-                    elif turn.end < word_start:
-                        speaker_idx += 1
                     else:
+                        # Word overlaps with speaker turn
+                        word_with_speaker = {
+                            "start": word["start"],
+                            "end": word["end"],
+                            "word": word["word"].strip(),
+                            "speaker": speaker,
+                        }
+                        words_with_speakers.append(word_with_speaker)
                         break
+                else:
+                    # No more diarization segments; assign 'Unknown' speaker
+                    word_with_speaker = {
+                        "start": word["start"],
+                        "end": word["end"],
+                        "word": word["word"].strip(),
+                        "speaker": "Unknown",
+                    }
+                    words_with_speakers.append(word_with_speaker)
 
-            if segment_text:
-                combined_text = "".join(segment_text)
-                cleaned_text = re.sub("  ", " ", combined_text).strip()
-                new_segment = {
-                    "avg_logprob": segment["avg_logprob"],
-                    "start": segment_start - offset_seconds,
-                    "end": segment_end - offset_seconds,
-                    "speaker": speaker,
-                    "text": cleaned_text,
-                    "words": segment_words,
-                }
-                final_segments.append(new_segment)
-
-        time_merging_end = time.time()
+        time_assignment_end = time.time()
         print(
-            f"Finished with merging, took {time_merging_end - time_diraization_end:.5} seconds"
+            f"Finished speaker assignment, took {time_assignment_end - time_diarization_end:.5} seconds"
         )
 
-        print("Starting cleaning")
-        segments = final_segments
-        # Make output
-        output = []  # Initialize an empty list for the output
+        print("Starting segment building")
 
-        # Initialize the first group with the first segment
-        current_group = {
-            "start": str(segments[0]["start"]),
-            "end": str(segments[0]["end"]),
-            "speaker": segments[0]["speaker"],
-            "avg_logprob": segments[0]["avg_logprob"],
-        }
+        # Build new segments based on speaker changes
+        new_segments = []
 
-        if transcript_output_format in ("segments_only", "both"):
-            current_group["text"] = segments[0]["text"]
-        if transcript_output_format in ("words_only", "both"):
-            current_group["words"] = segments[0]["words"]
+        if words_with_speakers:
+            current_speaker = words_with_speakers[0]["speaker"]
+            current_segment_words = [words_with_speakers[0]]
+            current_segment_start = words_with_speakers[0]["start"]
+            current_segment_end = words_with_speakers[0]["end"]
 
-        for i in range(1, len(segments)):
-            # Calculate time gap between consecutive segments
-            time_gap = segments[i]["start"] - segments[i - 1]["end"]
+            for word_info in words_with_speakers[1:]:
+                word_speaker = word_info["speaker"]
+                if word_speaker == current_speaker:
+                    # Continue current segment
+                    current_segment_words.append(word_info)
+                    current_segment_end = word_info["end"]
+                else:
+                    # Save current segment
+                    segment_text = ' '.join([w['word'] for w in current_segment_words])
+                    new_segment = {
+                        "start": current_segment_start,
+                        "end": current_segment_end,
+                        "speaker": current_speaker,
+                        "text": segment_text.strip(),
+                        "words": current_segment_words,
+                    }
+                    new_segments.append(new_segment)
 
-            # If the current segment's speaker is the same as the previous segment's speaker,
-            # and the time gap is less than or equal to 2 seconds, group them
-            if segments[i]["speaker"] == segments[i - 1]["speaker"] and time_gap <= 2 and group_segments:
-                current_group["end"] = str(segments[i]["end"])
-                if transcript_output_format in ("segments_only", "both"):
-                    current_group["text"] += " " + segments[i]["text"]
-                if transcript_output_format in ("words_only", "both"):
-                    current_group.setdefault("words", []).extend(segments[i]["words"])
-            else:
-                # Add the current_group to the output list
-                output.append(current_group)
+                    # Start a new segment
+                    current_speaker = word_speaker
+                    current_segment_words = [word_info]
+                    current_segment_start = word_info["start"]
+                    current_segment_end = word_info["end"]
 
-                # Start a new group with the current segment
-                current_group = {
-                    "start": str(segments[i]["start"]),
-                    "end": str(segments[i]["end"]),
-                    "speaker": segments[i]["speaker"],
-                    "avg_logprob": segments[i]["avg_logprob"],
-                }
-                if transcript_output_format in ("segments_only", "both"):
-                    current_group["text"] = segments[i]["text"]
-                if transcript_output_format in ("words_only", "both"):
-                    current_group["words"] = segments[i]["words"]
+            # Add the last segment
+            segment_text = ' '.join([w['word'] for w in current_segment_words])
+            new_segment = {
+                "start": current_segment_start,
+                "end": current_segment_end,
+                "speaker": current_speaker,
+                "text": segment_text.strip(),
+                "words": current_segment_words,
+            }
+            new_segments.append(new_segment)
 
-        # Add the last group to the output list
-        output.append(current_group)
+        # Optionally merge segments with small time gaps
+        final_segments = []
 
-        time_cleaning_end = time.time()
+        if new_segments:
+            current_group = new_segments[0]
+
+            for segment in new_segments[1:]:
+                time_gap = segment["start"] - current_group["end"]
+                if (
+                    segment["speaker"] == current_group["speaker"]
+                    and time_gap <= 2
+                    and group_segments
+                ):
+                    # Merge segments
+                    current_group["end"] = segment["end"]
+                    current_group["text"] += " " + segment["text"]
+                    current_group["words"].extend(segment["words"])
+                else:
+                    # Add current group to final_segments
+                    final_segments.append(current_group)
+                    # Start a new group
+                    current_group = segment
+
+            # Add the last group
+            final_segments.append(current_group)
+
+        time_segment_end = time.time()
         print(
-            f"Finished with cleaning, took {time_cleaning_end - time_merging_end:.5} seconds"
+            f"Finished segment building, took {time_segment_end - time_assignment_end:.5} seconds"
         )
         time_end = time.time()
         time_diff = time_end - time_start
 
         system_info = f"""Processing time: {time_diff:.5} seconds"""
         print(system_info)
-        return output, detected_num_speakers, transcript_info.language
+        return final_segments, detected_num_speakers, transcript_info.language
