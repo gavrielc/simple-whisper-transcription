@@ -6,6 +6,7 @@ import os
 import time
 import torch
 import re
+import concurrent.futures
 
 from cog import BasePredictor, BaseModel, Input, File, Path
 from faster_whisper import WhisperModel
@@ -14,7 +15,6 @@ from pyannote.audio import Pipeline
 
 class Output(BaseModel):
     transcription: str
-
 
 def format_speech(speech_list):
     def format_time(seconds):
@@ -37,28 +37,33 @@ class Predictor(BasePredictor):
 
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
-        model_name = "large-v2"
+        model_name = "large-v3"
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.model = WhisperModel(
             model_name,
             device=device,
-            compute_type="float16" if device == "cuda" else "float32",
+            compute_type = "float16" if device == "cuda" else "float32",
         )
         self.diarization_model = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token="YOUR_HUGGINGFACE_TOKEN",
-        ).to(torch.device(device))
+            use_auth_token="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",
+        ).to(torch.device("cuda"))
 
     def predict(
         self,
-        file: Path = Input(description="Audio file", default=None),
+        file: Path = Input(description="audio file", default=None),
         prompt: str = Input(
-            description="Vocabulary: provide names, acronyms, and loanwords in a list. Use punctuation for best accuracy.",
+            description="Vocabulary: provide names, acronyms and loanwords in a list. Use punctuation for best accuracy.",
             default=None,
         ),
+
     ) -> Output:
         """Run a single prediction on the model"""
+        # Check if either filestring, filepath or file is provided, but only 1 of them
+        """ if sum([file_string is not None, file_url is not None, file is not None]) != 1:
+            raise RuntimeError("Provide either file_string, file or file_url") """
+
         try:
             # Generate a temporary filename
             temp_wav_filename = f"temp-{time.time_ns()}.wav"
@@ -72,7 +77,7 @@ class Predictor(BasePredictor):
                     [
                         "ffmpeg",
                         "-i",
-                        str(file),
+                        file,
                         "-ar",
                         "16000",
                         "-ac",
@@ -80,8 +85,7 @@ class Predictor(BasePredictor):
                         "-c:a",
                         "pcm_s16le",
                         temp_wav_filename,
-                    ],
-                    check=True,
+                    ]
                 )
 
             segments, detected_num_speakers, detected_language = self.speech_to_text(
@@ -95,10 +99,8 @@ class Predictor(BasePredictor):
                 transcript_output_format="segments_only",
             )
 
-            print(f"Done with inference")
-            print(
-                f"Number of Speakers: {detected_num_speakers}. Detected language: {detected_language}."
-            )
+            print(f"done with inference")
+            print(f"Number of Speakers: {detected_num_speakers}. Detected language: {detected_language}.")
             transcription = format_speech(segments)
             # Return the results as a JSON object
             return Output(
@@ -106,7 +108,7 @@ class Predictor(BasePredictor):
             )
 
         except Exception as e:
-            raise RuntimeError("Error running inference with local model") from e
+            raise RuntimeError("Error Running inference with local model", e)
 
         finally:
             # Clean up
@@ -129,53 +131,60 @@ class Predictor(BasePredictor):
     ):
         time_start = time.time()
 
-        # Transcribe audio
-        print("Starting transcription")
-        options = dict(
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=1000),
-            initial_prompt=prompt,
-            word_timestamps=word_timestamps,
-            language=language,
-        )
-        segments, transcript_info = self.model.transcribe(audio_file_wav, **options)
-        segments = list(segments)
-        segments = [
-            {
-                "avg_logprob": s.avg_logprob,
-                "start": float(s.start + offset_seconds),
-                "end": float(s.end + offset_seconds),
-                "text": s.text,
-                "words": [
-                    {
-                        "start": float(w.start + offset_seconds),
-                        "end": float(w.end + offset_seconds),
-                        "word": w.word,
-                        "probability": w.probability,
-                    }
-                    for w in s.words
-                ],
-            }
-            for s in segments
-        ]
+        # Define functions for parallel execution
+        def run_transcription():
+            print("Starting transcribing")
+            options = dict(
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=1000),
+                initial_prompt=prompt,
+                word_timestamps=word_timestamps,
+                language=language,
+            )
+            segments, transcript_info = self.model.transcribe(audio_file_wav, **options)
+            segments = list(segments)
+            segments = [
+                {
+                    "avg_logprob": s.avg_logprob,
+                    "start": float(s.start + offset_seconds),
+                    "end": float(s.end + offset_seconds),
+                    "text": s.text,
+                    "words": [
+                        {
+                            "start": float(w.start + offset_seconds),
+                            "end": float(w.end + offset_seconds),
+                            "word": w.word,
+                            "probability": w.probability,
+                        }
+                        for w in s.words
+                    ],
+                }
+                for s in segments
+            ]
+            return segments, transcript_info
 
-        time_transcribing_end = time.time()
-        print(
-            f"Finished transcription, took {time_transcribing_end - time_start:.5} seconds"
-        )
+        def run_diarization():
+            print("Starting diarization")
+            return self.diarization_model(audio_file_wav, num_speakers=num_speakers)
 
-        print("Starting diarization")
-        diarization = self.diarization_model(audio_file_wav, num_speakers=num_speakers)
+        # Run transcription and diarization in parallel
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_transcription = executor.submit(run_transcription)
+            future_diarization = executor.submit(run_diarization)
 
-        time_diarization_end = time.time()
-        print(
-            f"Finished diarization, took {time_diarization_end - time_transcribing_end:.5} seconds"
-        )
+            # Wait for both tasks to complete
+            segments, transcript_info = future_transcription.result()
+            diarization = future_diarization.result()
+
+        time_parallel_end = time.time()
+        print(f"Finished parallel processing, took {time_parallel_end - time_start:.5} seconds")
 
         print("Starting speaker assignment")
 
-        # Assign speakers to words
+        # Initialize variables to keep track of the current position in both lists
         margin = 0.1  # 0.1 seconds margin
+
+        # Initialize an empty list to hold words with speaker info
         words_with_speakers = []
 
         diarization_list = list(diarization.itertracks(yield_label=True))
@@ -227,7 +236,7 @@ class Predictor(BasePredictor):
 
         time_assignment_end = time.time()
         print(
-            f"Finished speaker assignment, took {time_assignment_end - time_diarization_end:.5} seconds"
+            f"Finished speaker assignment, took {time_assignment_end - time_parallel_end:.5} seconds"
         )
 
         print("Starting segment building")
